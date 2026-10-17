@@ -1,363 +1,86 @@
-name: Build and Release PWA to Switch
+name: Build Home Assistant NRO
 
 on:
   workflow_dispatch:
-    inputs:
-      release_type:
-        description: "Type of release (stable, beta, nightly)"
-        required: true
-        default: "beta"
-        type: choice
-        options:
-          - stable
-          - beta
-          - nightly
-
-      bump_level:
-        description: "Bump Level (SemVer only: major, minor, patch)"
-        required: false
-        default: "patch"
-        type: choice
-        options:
-          - patch
-          - minor
-          - major
-
-      version_override:
-        description: "Manually override new version (e.g. 1.2.3 or 1.0.0b1). Leave empty to use automatic calculation."
-        required: false
-        type: string
-
-      app_selection:
-        description: 'PWA Target to build: Select a configured app, multiple separated by comma, "all", or "new" to add a new PWA.'
-        required: true
-        default: 'all'
-        type: string
-
-      new_app_name:
-        description: 'New App Name (Only used if app_selection is "new")'
-        required: false
-        default: ''
-
-      new_app_url:
-        description: 'New Website/PWA URL (Only used if app_selection is "new")'
-        required: false
-        default: ''
-
-      new_app_icon:
-        description: 'New App Icon URL (Optional, only used if app_selection is "new")'
-        required: false
-        default: ''
-  push:
-    tags:
-      - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  preflight:
-    name: Preflight & Safety Checks
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.14'
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run Preflight Checks
-        run: python scripts/preflight.py
-        env:
-          ALLOW_RE_RELEASE: ${{ github.event.inputs.allow_re_release }}
-
-  risk-analysis:
-    name: Codebase Risk & Impact Analysis
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 2
-
-      - name: Analyze Git Diff
-        shell: bash
-        run: |
-          git diff --stat HEAD~1 HEAD > diff.txt || echo "First commit or dispatch" > diff.txt
-          cat diff.txt
-          
-          # Calculate changes in areas
-          C_CHANGES=$(grep -c "source/" diff.txt || true)
-          SCRIPT_CHANGES=$(grep -c "scripts/" diff.txt || true)
-          TOTAL_CHANGES=$(wc -l < diff.txt || echo 0)
-          
-          echo "### 📊 Codebase Impact Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- **C/C++ Source files modified:** $C_CHANGES" >> $GITHUB_STEP_SUMMARY
-          echo "- **Scripts files modified:** $SCRIPT_CHANGES" >> $GITHUB_STEP_SUMMARY
-          echo "- **Total files affected:** $TOTAL_CHANGES" >> $GITHUB_STEP_SUMMARY
-          
-          if grep -q "psel" diff.txt || grep -q "main.c" diff.txt; then
-            echo "> [!WARNING]" >> $GITHUB_STEP_SUMMARY
-            echo "> **High Risk Change:** System applets, profile selector, or main initialization paths modified." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "> [!NOTE]" >> $GITHUB_STEP_SUMMARY
-            echo "> Standard non-breaking release checks." >> $GITHUB_STEP_SUMMARY
-          fi
-
-  prep:
-    name: Prepare App Matrix
-    needs: [preflight, risk-analysis]
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-      new_app_added: ${{ steps.set-matrix.outputs.new_app_added }}
-      tag: ${{ steps.meta.outputs.tag }}
-      version: ${{ steps.meta.outputs.version }}
-      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
-      title: ${{ steps.meta.outputs.title }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.14'
-
-      - name: Resolve app matrix from supported_apps.json
-        id: set-matrix
-        shell: bash
-        run: |
-          APP_SEL="${{ github.event.inputs.app_selection }}"
-          NEW_NAME="${{ github.event.inputs.new_app_name }}"
-          NEW_URL="${{ github.event.inputs.new_app_url }}"
-          NEW_ICON="${{ github.event.inputs.new_app_icon }}"
-
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if [ "$APP_SEL" = "new" ]; then
-              # Register new app and build only it
-              MATRIX=$(python3 scripts/build_matrix_generator.py "new" "$NEW_NAME" "$NEW_URL" "$NEW_ICON")
-              echo "new_app_added=true" >> $GITHUB_OUTPUT
-            else
-              MATRIX=$(python3 scripts/build_matrix_generator.py "$APP_SEL")
-              echo "new_app_added=false" >> $GITHUB_OUTPUT
-            fi
-          else
-            # Tag push: always build all apps from supported_apps.json
-            MATRIX=$(python3 scripts/build_matrix_generator.py "all")
-            echo "new_app_added=false" >> $GITHUB_OUTPUT
-          fi
-
-          # Use heredoc to safely write JSON to GITHUB_OUTPUT
-          echo "matrix<<EOF" >> $GITHUB_OUTPUT
-          echo "$MATRIX" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Calculate Version
-        id: meta
-        shell: bash
-        run: |
-          RTYPE="${{ github.event.inputs.release_type || 'stable' }}"
-          LEVEL="${{ github.event.inputs.bump_level || 'patch' }}"
-          OVERRIDE="${{ github.event.inputs.version_override || '' }}"
-
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            NEW_VER=$(python3 scripts/version_manager.py bump --type "$RTYPE" --level "$LEVEL" --override "$OVERRIDE")
-            TAG="v${NEW_VER}"
-            IS_PRE="$( [ "$RTYPE" = 'stable' ] && echo 'false' || echo 'true' )"
-          else
-            TAG="${{ github.ref_name }}"
-            NEW_VER="${TAG#v}"
-            IS_PRE="false"
-          fi
-
-          echo "tag=${TAG}" >> $GITHUB_OUTPUT
-          echo "version=${NEW_VER}" >> $GITHUB_OUTPUT
-          echo "is_prerelease=${IS_PRE}" >> $GITHUB_OUTPUT
-          echo "title=Release ${TAG}" >> $GITHUB_OUTPUT
-
-      - name: Upload updated supported_apps.json
-        if: steps.set-matrix.outputs.new_app_added == 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          name: updated-supported-apps
-          path: supported_apps.json
-
   build:
-    name: Build Wrapper (${{ matrix.name }})
-    needs: prep
+    name: Build Home Assistant for Switch
     runs-on: ubuntu-latest
     container: devkitpro/devkita64:latest
-    strategy:
-      fail-fast: false
-      matrix: ${{fromJson(needs.prep.outputs.matrix)}}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Cache APT packages
-        uses: actions/cache@v6
-        with:
-          path: /var/cache/apt/archives
-          key: ${{ runner.os }}-apt-cache
-
       - name: Install dependencies
         run: |
-          apt-get update && apt-get install -y python3-pip python3-pillow python3-requests python3-bs4 curl jq zip libssl-dev build-essential git
-          
-      - name: Extract PWA details and generate assets
+          apt-get update
+          apt-get install -y \
+            python3 \
+            python3-pip \
+            python3-pillow \
+            python3-requests \
+            python3-bs4 \
+            curl \
+            jq \
+            zip \
+            git \
+            build-essential
+
+      - name: Generate Home Assistant configuration
         shell: bash
         run: |
           python3 scripts/extract_pwa.py \
-            --url "${{ matrix.url }}" \
-            --name "${{ matrix.name }}" \
-            --icon "${{ matrix.icon }}" \
+            --url "http://192.168.22.63:8123" \
+            --name "Home Assistant" \
+            --icon "" \
             --output-icon source/icon.jpg \
             --output-hdr source/config.h
 
-      - name: Update Makefile App Metadata
+      - name: Update application title
         shell: bash
         run: |
-          sed -i 's/^APP_TITLE\t:=.*/APP_TITLE\t:=\t${{ matrix.name }}/g' Makefile
-          sed -i "s/^APP_VERSION\t:=.*/APP_VERSION\t:=\t${{ needs.prep.outputs.version }}/g" Makefile
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
 
-      - name: Build NRO
-        run: |
-          export PATH="/opt/devkitpro/devkitA64/bin:/opt/devkitpro/tools/bin:$PATH"
-          make clean && make -j$(nproc)
+          path = Path("Makefile")
+          text = path.read_text()
+          text, count = re.subn(
+              r"^APP_TITLE[ \t]*:=.*$",
+              "APP_TITLE := Home Assistant",
+              text,
+              flags=re.MULTILINE,
+          )
+          if count != 1:
+              raise SystemExit(
+                  "Expected exactly one APP_TITLE assignment in Makefile."
+              )
+          path.write_text(text)
+          PY
 
-      - name: Setup NSP Build Tools
-        run: |
-          git clone --depth 1 https://github.com/The-4n/hacBrewPack.git
-          cd hacBrewPack && make && cp hacbrewpack /usr/local/bin/ && cd ..
-          if [ "${{ secrets.PROD_KEYS }}" != "" ]; then
-            mkdir -p ~/.switch
-            echo "${{ secrets.PROD_KEYS }}" > ~/.switch/prod.keys
-          fi
-
-      - name: Create Release Artifacts
+      - name: Compile NRO
         shell: bash
         run: |
-          SAFE_NAME=$(echo "${{ matrix.name }}" | sed 's/[^a-zA-Z0-9]/_/g')
-          cp pwa2nx.nro ${SAFE_NAME}.nro
           export PATH="/opt/devkitpro/devkitA64/bin:/opt/devkitpro/tools/bin:$PATH"
-          python3 scripts/build_nsp.py "${{ matrix.name }}" "${SAFE_NAME}"
-          rm pwa2nx.nro
+          make clean
+          make -j"$(nproc)"
+          test -s pwa2nx.nro
 
-      - name: Upload Artifacts for Release Job
+      - name: Prepare downloadable file
+        shell: bash
+        run: |
+          mkdir -p output
+          cp pwa2nx.nro output/Home_Assistant.nro
+
+      - name: Upload Home Assistant NRO
         uses: actions/upload-artifact@v7
         with:
-          name: build-assets-${{ matrix.name }}
-          path: |
-            *.nro
-            *.nsp
-          if-no-files-found: ignore
-
-  release:
-    name: Create Tagged Release
-    needs: [prep, build]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.14'
-
-      - name: Download all build artifacts
-        uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Generate Advanced Changelog
-        shell: bash
-        run: |
-          python3 scripts/generate_release_body.py "${{ needs.prep.outputs.tag }}" > body.md
-          python3 scripts/generate_changelog.py >> body.md
-
-      - name: Overwrite / Delete Existing Tag
-        if: github.event.inputs.version_override != ''
-        shell: bash
-        run: |
-          TAG="${{ needs.prep.outputs.tag }}"
-          gh release delete "${TAG}" --yes 2>/dev/null || true
-          git push --delete origin "${TAG}" 2>/dev/null || true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Publish GitHub Release
-        id: publish_release
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            artifacts/*.nro
-            artifacts/*.nsp
-          fail_on_unmatched_files: false
-          name: ${{ needs.prep.outputs.title }}
-          tag_name: ${{ needs.prep.outputs.tag }}
-          body_path: body.md
-          prerelease: ${{ needs.prep.outputs.is_prerelease == 'true' }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Commit New App + Post-Release Version Bump
-        if: success()
-        shell: bash
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git reset --hard HEAD
-          git pull --rebase origin ${{ github.ref_name }}
-
-          CHANGED_FILES=""
-
-          # Commit newly added PWA to supported_apps.json if applicable
-          if [ "${{ needs.prep.outputs.new_app_added }}" = "true" ]; then
-            # Restore the updated supported_apps.json from artifact
-            mv artifacts/supported_apps.json supported_apps.json 2>/dev/null || true
-            if ! git diff --quiet supported_apps.json 2>/dev/null; then
-              CHANGED_FILES="$CHANGED_FILES supported_apps.json"
-            fi
-          fi
-
-          # Bump dev version and update issue template placeholders
-          RELEASE_TAG="${{ needs.prep.outputs.tag }}"
-          python3 scripts/update_templates.py "${RELEASE_TAG#v}"
-          python3 scripts/version_manager.py bump --type dev --level patch
-          CHANGED_FILES="$CHANGED_FILES Makefile app.json .github/ISSUE_TEMPLATE/bug_report.yml"
-
-          git add $CHANGED_FILES
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: post-release bump & template update [skip ci]"
-            git push origin HEAD:${{ github.ref_name }} || \
-              (git pull --rebase origin ${{ github.ref_name }} && git push origin HEAD:${{ github.ref_name }})
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Cleanup On Failure
-        if: failure()
-        shell: bash
-        run: |
-          TAG="${{ needs.prep.outputs.tag }}"
-          echo "Build failed. Rolling back created tag/draft if any..."
-          gh release delete "${TAG}" --yes || true
-          git push --delete origin "${TAG}" || true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: Home-Assistant-Switch
+          path: output/Home_Assistant.nro
+          if-no-files-found: error
+          retention-days: 14
